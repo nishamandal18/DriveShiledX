@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import sqlite3
 import struct
@@ -80,9 +81,79 @@ def _rowdict(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
 def init_database() -> None:
     conn = get_connection()
     conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+    _ensure_manual_challan_schema(conn)
     _seed_defaults(conn)
     conn.commit()
     conn.close()
+
+
+def _ensure_manual_challan_schema(conn: sqlite3.Connection) -> None:
+    """Ensure VIOLATION_NOTICE can store authority-created manual challans.
+
+    Manual challans are not tied to a detected VIOLATION, so violation_id must be
+    nullable. Existing databases created with an older NOT NULL definition are
+    migrated in-place while preserving existing rows and table indexes.
+    """
+    try:
+        columns = conn.execute("PRAGMA table_info(VIOLATION_NOTICE)").fetchall()
+    except sqlite3.OperationalError:
+        return
+
+    violation_col = next((r for r in columns if r["name"] == "violation_id"), None)
+    if not violation_col or not violation_col["notnull"]:
+        return
+
+    ddl_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='VIOLATION_NOTICE'"
+    ).fetchone()
+    if not ddl_row or not ddl_row["sql"]:
+        return
+
+    # Save explicit indexes so they can be recreated after the table rebuild.
+    index_rows = conn.execute(
+        "SELECT name, sql FROM sqlite_master "
+        "WHERE type='index' AND tbl_name='VIOLATION_NOTICE' AND sql IS NOT NULL"
+    ).fetchall()
+
+    old_name = "VIOLATION_NOTICE__legacy"
+    conn.execute(f"DROP TABLE IF EXISTS {old_name}")
+
+    ddl = ddl_row["sql"]
+    # Rename the table in the CREATE statement and remove NOT NULL only from
+    # the violation_id column definition.
+    ddl = re.sub(
+        r"(?i)^\s*CREATE\s+TABLE\s+VIOLATION_NOTICE",
+        "CREATE TABLE VIOLATION_NOTICE",
+        ddl,
+        count=1,
+    )
+    ddl = re.sub(
+        r"(?i)(\bviolation_id\b[^,]*?)\s+NOT\s+NULL",
+        r"\1",
+        ddl,
+        count=1,
+    )
+
+    conn.execute("ALTER TABLE VIOLATION_NOTICE RENAME TO VIOLATION_NOTICE__legacy")
+    conn.execute(ddl)
+
+    column_names = [r["name"] for r in columns]
+    quoted = ",".join(f'"{name}"' for name in column_names)
+    conn.execute(
+        f"INSERT INTO VIOLATION_NOTICE ({quoted}) "
+        f"SELECT {quoted} FROM VIOLATION_NOTICE__legacy"
+    )
+    conn.execute("DROP TABLE VIOLATION_NOTICE__legacy")
+
+    # Recreate non-auto indexes that existed on the original table.
+    for row in index_rows:
+        sql = row["sql"]
+        if sql:
+            try:
+                conn.execute(sql)
+            except sqlite3.OperationalError:
+                # SQLite may already have recreated an equivalent auto-index.
+                pass
 
 
 def _seed_defaults(conn: sqlite3.Connection) -> None:
@@ -649,6 +720,175 @@ def bulk_issue_challans_for_all(issued_by: int, delivery_channel: str = "dashboa
             "unregistered": issued - matched}
 
 
+
+def create_manual_challan(
+    plate_number: str,
+    amount: float,
+    issued_by: int,
+    due_date: Optional[str] = None,
+    notes: str = "",
+    delivery_channel: str = "dashboard",
+) -> Optional[Dict[str, Any]]:
+    """Create an authority-issued challan without requiring a detected violation.
+
+    The plate is matched against REGISTERED_VEHICLE when possible. Manual notices
+    still use the existing repeat-offence tier fields so payment/overdue handling
+    and the owner dashboard work exactly like detected-violation challans.
+    """
+    plate = (plate_number or "").strip().upper()
+    if not plate:
+        raise ValueError("Plate number is required.")
+
+    try:
+        amount = float(amount)
+    except (TypeError, ValueError):
+        raise ValueError("Fine amount must be a valid number.")
+
+    if amount <= 0:
+        raise ValueError("Fine amount must be greater than ₹0.")
+
+    if delivery_channel not in ("dashboard", "email", "both"):
+        delivery_channel = "dashboard"
+
+    if due_date:
+        try:
+            due = datetime.fromisoformat(str(due_date)).date().isoformat()
+        except ValueError:
+            try:
+                due = datetime.strptime(str(due_date), "%Y-%m-%d").date().isoformat()
+            except ValueError:
+                raise ValueError("Due date must be in YYYY-MM-DD format.")
+    else:
+        due = (datetime.now() + timedelta(days=GRACE_DAYS)).date().isoformat()
+
+    conn = get_connection()
+    try:
+        match = conn.execute(
+            """
+            SELECT rv.reg_vehicle_id, rv.owner_id, rv.vehicle_type,
+                   oa.name AS owner_name, oa.email AS owner_email,
+                   oa.phone AS owner_phone
+            FROM REGISTERED_VEHICLE rv
+            JOIN OWNER_ACCOUNT oa ON oa.owner_id = rv.owner_id
+            WHERE UPPER(rv.plate_number) = UPPER(?)
+            """,
+            (plate,),
+        ).fetchone()
+
+        # Count previous challans for the same plate. This keeps the existing
+        # first/second/third offence semantics even when the authority creates
+        # a challan manually.
+        history = conn.execute(
+            "SELECT COUNT(*) AS c FROM VIOLATION_NOTICE "
+            "WHERE UPPER(COALESCE(plate_number,'')) = UPPER(?)",
+            (plate,),
+        ).fetchone()
+        offense_no = int(history["c"] or 0) + 1
+
+        tier = "first" if offense_no <= 1 else "second" if offense_no == 2 else "third"
+        sched = FINE_SCHEDULE[tier]
+        overdue_amount = float(sched["overdue"])
+
+        if tier == "first":
+            action = "warning_fine"
+            suspension_months = 0
+            default_note = "Manual e-challan — first offence."
+        elif tier == "second":
+            action = "escalated_fine"
+            suspension_months = 0
+            default_note = "Manual e-challan — second offence."
+        else:
+            action = "license_suspension"
+            suspension_months = 3 + max(0, offense_no - 3)
+            default_note = (
+                f"Manual e-challan — repeated offence; driving licence "
+                f"suspension for {suspension_months} month(s)."
+            )
+
+        final_notes = notes.strip() or default_note
+
+        cur = conn.execute(
+            """
+            INSERT INTO VIOLATION_NOTICE(
+                violation_id, reg_vehicle_id, owner_id, plate_number, issued_by,
+                base_amount, amount, overdue_amount, offense_count, offense_tier,
+                action_taken, suspension_months, delivery_channel, due_date,
+                payment_status, notes
+            )
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                None,
+                match["reg_vehicle_id"] if match else None,
+                match["owner_id"] if match else None,
+                plate,
+                issued_by,
+                amount,
+                amount,
+                overdue_amount,
+                offense_no,
+                tier,
+                action,
+                suspension_months,
+                delivery_channel,
+                due,
+                "pending",
+                final_notes,
+            ),
+        )
+        notice_id = cur.lastrowid
+        conn.commit()
+    except sqlite3.IntegrityError as exc:
+        conn.rollback()
+        raise ValueError(
+            "Could not create the manual challan. "
+            "Make sure the database schema allows violation_id to be NULL."
+        ) from exc
+    finally:
+        conn.close()
+
+    subject = f"DriveShieldX manual e-Challan · {plate}"
+    body = (
+        f"Manual e-challan issued for vehicle {plate}. "
+        f"Fine ₹{amount:.0f}. Due {due}. "
+        f"Offence tier: {tier}."
+    )
+    recipient = (match["owner_email"] if match else None) or plate
+
+    if delivery_channel in ("email", "both"):
+        queue_alert("email", recipient, subject, body)
+    if delivery_channel in ("dashboard", "both"):
+        queue_alert("dashboard", recipient, subject, body)
+
+    log_system_event(
+        "notice",
+        f"Manual e-challan issued #{notice_id} {plate} tier={tier} ₹{amount:.0f}",
+        level="warning" if tier != "first" else "info",
+        payload={
+            "notice_id": notice_id,
+            "plate_number": plate,
+            "manual": True,
+            "offense_count": offense_no,
+        },
+    )
+
+    return {
+        "notice_id": notice_id,
+        "plate_number": plate,
+        "matched_owner": bool(match),
+        "owner_name": match["owner_name"] if match else None,
+        "owner_email": match["owner_email"] if match else None,
+        "amount": amount,
+        "overdue_amount": overdue_amount,
+        "offense_count": offense_no,
+        "offense_tier": tier,
+        "action_taken": action,
+        "suspension_months": suspension_months,
+        "due_date": due,
+        "payment_status": "pending",
+    }
+
+
 # Back-compat shim: the older manual single-notice path still works.
 def create_notice(violation_id: int, reg_vehicle_id: int, issued_by: int, amount: float,
                    due_date: Optional[str] = None, external_reference: Optional[str] = None,
@@ -736,11 +976,11 @@ def get_all_notices(limit: int = 200) -> List[Dict[str, Any]]:
         FROM VIOLATION_NOTICE vn
         LEFT JOIN OWNER_ACCOUNT oa ON oa.owner_id = vn.owner_id
         LEFT JOIN REGISTERED_VEHICLE rv ON rv.reg_vehicle_id = vn.reg_vehicle_id
-        JOIN VIOLATION v ON v.violation_id = vn.violation_id
-        JOIN SPEED_RECORD sr ON sr.speed_id = v.speed_id
-        JOIN VEHICLE ve ON ve.vehicle_id = sr.vehicle_id
-        JOIN VIDEO_SESSION vs ON vs.session_id = ve.session_id
-        JOIN CAMERA cam ON cam.camera_id = vs.camera_id
+        LEFT JOIN VIOLATION v ON v.violation_id = vn.violation_id
+        LEFT JOIN SPEED_RECORD sr ON sr.speed_id = v.speed_id
+        LEFT JOIN VEHICLE ve ON ve.vehicle_id = sr.vehicle_id
+        LEFT JOIN VIDEO_SESSION vs ON vs.session_id = ve.session_id
+        LEFT JOIN CAMERA cam ON cam.camera_id = vs.camera_id
         ORDER BY vn.issued_at DESC LIMIT ?
         """, (limit,)
     ).fetchall(); conn.close(); return [dict(r) for r in rows]
@@ -756,11 +996,11 @@ def get_owner_notices(owner_id: int) -> List[Dict[str, Any]]:
                sr.speed_value, sr.speed_limit, cam.location
         FROM VIOLATION_NOTICE vn
         LEFT JOIN REGISTERED_VEHICLE rv ON rv.reg_vehicle_id = vn.reg_vehicle_id
-        JOIN VIOLATION v ON v.violation_id = vn.violation_id
-        JOIN SPEED_RECORD sr ON sr.speed_id = v.speed_id
-        JOIN VEHICLE ve ON ve.vehicle_id = sr.vehicle_id
-        JOIN VIDEO_SESSION vs ON vs.session_id = ve.session_id
-        JOIN CAMERA cam ON cam.camera_id = vs.camera_id
+        LEFT JOIN VIOLATION v ON v.violation_id = vn.violation_id
+        LEFT JOIN SPEED_RECORD sr ON sr.speed_id = v.speed_id
+        LEFT JOIN VEHICLE ve ON ve.vehicle_id = sr.vehicle_id
+        LEFT JOIN VIDEO_SESSION vs ON vs.session_id = ve.session_id
+        LEFT JOIN CAMERA cam ON cam.camera_id = vs.camera_id
         WHERE vn.owner_id = ? ORDER BY vn.issued_at DESC
         """, (owner_id,)
     ).fetchall(); conn.close(); return [dict(r) for r in rows]

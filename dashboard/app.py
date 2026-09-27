@@ -38,6 +38,7 @@ from database.db_manager import (
     authenticate_owner,
     authenticate_user,
     bulk_issue_challans_for_all,
+    create_manual_challan,
     create_notice,
     create_owner_account,
     delete_zone,
@@ -1132,26 +1133,104 @@ def page_notice_desk() -> None:
         st.rerun()
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # --- manual single issue (optional, registered vehicles) ---
-    with st.expander("Issue a single notice manually (registered vehicle)", expanded=False):
-        vehicles = get_registered_vehicles()
-        if not unissued:
-            st.info("No unissued violations right now.")
-        elif not vehicles:
-            st.warning("No registered vehicles yet — use the bulk auto-issue above, which also covers unregistered plates.")
-        else:
-            vio_options = {f"Violation #{v['violation_id']} · {v['speed_value']} km/h · {v['location']}": v for v in unissued}
-            reg_options = {f"{rv['plate_number']} · {rv['owner_name']}": rv for rv in vehicles}
-            vio_label = st.selectbox("Violation", list(vio_options.keys()))
-            reg_label = st.selectbox("Attach to registered vehicle", list(reg_options.keys()))
-            amount = st.number_input("Fine amount (₹)", min_value=0.0, value=1500.0, step=100.0)
-            due = st.date_input("Due date", value=date.today() + timedelta(days=14))
-            notes = st.text_area("Authority notes")
-            if st.button("Issue manual notice", use_container_width=True):
-                ok = create_notice(vio_options[vio_label]["violation_id"], reg_options[reg_label]["reg_vehicle_id"],
-                                   user["user_id"], float(amount), due.isoformat(), None, notes)
-                st.success("Notice issued.") if ok else st.error("That violation already has a notice.")
-                st.rerun()
+    # --- standalone manual issue: does NOT depend on an unissued detection ---
+    with st.expander("📝 Issue a manual e-challan", expanded=False):
+        st.caption(
+            "Use this when an authority needs to issue a challan directly by vehicle plate. "
+            "It works even when there is no detected overspeeding record."
+        )
+
+        mc1, mc2 = st.columns(2)
+        with mc1:
+            manual_plate = st.text_input(
+                "Vehicle plate number",
+                placeholder="e.g. MH01AB1234",
+                key="manual_challan_plate",
+            )
+            manual_amount = st.number_input(
+                "Fine amount (₹)",
+                min_value=1.0,
+                value=500.0,
+                step=100.0,
+                key="manual_challan_amount",
+            )
+            manual_due = st.date_input(
+                "Due date",
+                value=date.today() + timedelta(days=14),
+                key="manual_challan_due",
+            )
+
+        with mc2:
+            manual_channel_label = st.selectbox(
+                "Notice delivery",
+                ["Owner dashboard only", "Email outbox only", "Both dashboard + email"],
+                key="manual_challan_channel",
+            )
+            manual_notes = st.text_area(
+                "Authority notes",
+                placeholder="Optional reason / remarks for this manual challan",
+                height=125,
+                key="manual_challan_notes",
+            )
+
+        manual_channel = {
+            "Owner dashboard only": "dashboard",
+            "Email outbox only": "email",
+            "Both dashboard + email": "both",
+        }[manual_channel_label]
+
+        if manual_plate.strip():
+            matched = next(
+                (
+                    v for v in get_registered_vehicles()
+                    if str(v.get("plate_number", "")).strip().upper() == manual_plate.strip().upper()
+                ),
+                None,
+            )
+            if matched:
+                st.success(
+                    f"Registered owner found: **{matched.get('owner_name', 'Unknown')}** · "
+                    f"{matched.get('vehicle_type', 'vehicle')}"
+                )
+            else:
+                st.info("No registered owner found for this plate. The manual challan can still be issued.")
+
+        preview = {
+            "Plate": manual_plate.strip().upper() or "—",
+            "Fine": f"₹{manual_amount:,.0f}",
+            "Due": manual_due.isoformat(),
+            "Delivery": manual_channel_label,
+        }
+        st.dataframe(pd.DataFrame([preview]), use_container_width=True, hide_index=True)
+
+        if st.button("Issue Manual E-Challan", use_container_width=True, key="issue_manual_challan"):
+            if not manual_plate.strip():
+                st.error("Vehicle plate number is required.")
+            else:
+                try:
+                    result = create_manual_challan(
+                        plate_number=manual_plate,
+                        amount=float(manual_amount),
+                        issued_by=user["user_id"],
+                        due_date=manual_due.isoformat(),
+                        notes=manual_notes,
+                        delivery_channel=manual_channel,
+                    )
+                    owner_text = (
+                        f" · owner: {result['owner_name']}"
+                        if result.get("owner_name")
+                        else " · no registered owner matched"
+                    )
+                    st.success(
+                        f"Manual e-challan #{result['notice_id']} issued for "
+                        f"{result['plate_number']} · ₹{result['amount']:,.0f}"
+                        f"{owner_text}."
+                    )
+                    st.rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
+                except Exception as exc:
+                    st.error(f"Could not issue the manual e-challan: {exc}")
 
     # --- issued notices table ---
     if not all_notices:
