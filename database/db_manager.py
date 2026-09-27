@@ -20,10 +20,11 @@ PBKDF2_ITERATIONS = 260_000
 
 
 def get_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=15)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=15000")
     return conn
 
 
@@ -174,6 +175,7 @@ def add_user(name: str, email: str, password: str, role: str, contact: str) -> b
         conn.close()
         return True
     except sqlite3.IntegrityError:
+        conn.close()
         return False
 
 
@@ -214,6 +216,7 @@ def create_owner_account(name: str, email: str, password: str, phone: str) -> bo
         )
         conn.commit(); conn.close(); return True
     except sqlite3.IntegrityError:
+        conn.close()
         return False
 
 
@@ -249,6 +252,7 @@ def add_registered_vehicle(owner_id: int, plate_number: str, vehicle_type: str, 
         )
         conn.commit(); conn.close(); return True
     except sqlite3.IntegrityError:
+        conn.close()
         return False
 
 
@@ -280,6 +284,7 @@ def add_camera(location: str, camera_type: str, installation_date: str, status: 
         conn.execute("INSERT INTO STREAM_STATUS(camera_id) VALUES (?)", (cur.lastrowid,))
         conn.commit(); conn.close(); return True
     except sqlite3.IntegrityError:
+        conn.close()
         return False
 
 
@@ -599,6 +604,7 @@ def issue_challan_for_violation(violation_id: int, issued_by: int,
         )
         conn.commit(); conn.close()
     except sqlite3.IntegrityError:
+        conn.close()
         return None  # already has a notice
 
     # mark the underlying violation reviewed
@@ -663,6 +669,7 @@ def create_notice(violation_id: int, reg_vehicle_id: int, issued_by: int, amount
         )
         conn.commit(); conn.close(); log_system_event("notice", f"Notice issued for violation {violation_id}"); return True
     except sqlite3.IntegrityError:
+        conn.close()
         return False
 
 

@@ -62,6 +62,7 @@ st.radio = lambda label, options=None, *a, **k: (options[0] if options else None
 st.toggle = lambda *a, **k: k.get("value", True)
 st.button = _ret(False)
 st.download_button = _ret(False)
+st.link_button = _noop
 st.selectbox = lambda label, options, *a, **k: (options[0] if options else None)
 st.text_input = _ret("")
 st.text_area = _ret("")

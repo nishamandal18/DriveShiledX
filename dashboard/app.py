@@ -1512,9 +1512,9 @@ def page_owner_notices() -> None:
                 if cpc[0].button(f"Pay ₹{due_amt:,.0f}", key=f"open_{nid}", use_container_width=True):
                     st.session_state[checkout_key] = True
                     st.rerun()
-                cpc[1].caption("Opens a UPI checkout with a scannable QR (GPay / PhonePe / Paytm) — like any online site.")
+                cpc[1].caption("Choose UPI (scan a QR with any app) or pay by card — like any online checkout.")
             else:
-                render_checkout(n, due_amt)
+                render_checkout(n, due_amt, owner)
 
     # ---- payment history ----
     if paid:
@@ -1526,20 +1526,77 @@ def page_owner_notices() -> None:
                          use_container_width=True, hide_index=True)
 
 
-def render_checkout(notice: dict, amount: float) -> None:
-    """A realistic UPI checkout panel: real UPI deep-link QR + app buttons + a verify
-    step that mimics a payment-gateway callback. (Money movement requires a registered
-    merchant account; this verifies and settles the challan like a sandbox gateway.)"""
+def _settle_and_notify(nid: int, method: str, txn_ref: str, notice: dict, owner: dict, amount: float) -> None:
+    """Shared settlement step for both UPI and card: marks the challan paid in the DB,
+    then fires the email + SMS payment-confirmation (best-effort, never blocks the UI)."""
+    from backend.notifications import send_payment_confirmation
+    pay_notice(nid, method, txn_ref=txn_ref)
+    sent = send_payment_confirmation(
+        notice_id=nid,
+        plate_number=notice.get("plate_number", "—"),
+        amount=amount,
+        method=method,
+        txn_ref=txn_ref,
+        owner_email=(owner or {}).get("email"),
+        owner_phone=(owner or {}).get("phone"),
+    )
+    st.session_state[f"receipt_{nid}"] = {"method": method, "txn_ref": txn_ref, "sent": sent}
+
+
+def render_checkout(notice: dict, amount: float, owner: dict) -> None:
+    """Checkout panel with two payment options — UPI (scannable QR + per-app deep links)
+    and Credit/Debit card — each ending in a gateway-style verify/capture step that
+    settles the challan (DB update) and sends an email + SMS confirmation.
+    (Real money movement needs a registered payment-gateway merchant account; this
+    models the exact same verify → settle → notify shape a real integration would use —
+    see backend/payments.py and backend/card_payments.py for the honest scope note.)"""
+    nid = notice["notice_id"]
+
+    # already paid in this render cycle — show the receipt instead of the form
+    receipt = st.session_state.get(f"receipt_{nid}")
+    if receipt:
+        st.success(
+            f"Payment confirmed · {receipt['method']} · ref {receipt['txn_ref']}. "
+            f"Challan #{nid} cleared. ✅"
+        )
+        notif_bits = []
+        if receipt["sent"].get("email"):
+            notif_bits.append("email")
+        if receipt["sent"].get("sms"):
+            notif_bits.append("SMS")
+        if notif_bits:
+            st.caption(f"Confirmation sent via {' and '.join(notif_bits)}.")
+        st.session_state.pop(f"receipt_{nid}", None)
+        st.session_state.pop(f"checkout_{nid}", None)
+        return
+
+    st.markdown("<div class='panel-card' style='border-color:rgba(242,169,59,.5)'>", unsafe_allow_html=True)
+    st.markdown(f"<div class='section-title'>Secure Checkout · ₹{amount:,.0f}</div>", unsafe_allow_html=True)
+
+    pay_mode = st.radio("Pay using", ["UPI", "Credit / Debit Card"], key=f"paymode_{nid}", horizontal=True)
+
+    if pay_mode == "UPI":
+        _render_upi_checkout(notice, amount, owner)
+    else:
+        _render_card_checkout(notice, amount, owner)
+
+    if st.button("Cancel", key=f"cancel_{nid}"):
+        st.session_state.pop(f"checkout_{nid}", None)
+        st.session_state.pop(f"txnref_{nid}", None)
+        st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def _render_upi_checkout(notice: dict, amount: float, owner: dict) -> None:
     from backend.payments import build_upi_uri, new_txn_ref, qr_png_bytes, gateway_simulate_verify, PAYEE_VPA
     nid = notice["notice_id"]
     ref_key = f"txnref_{nid}"
     if ref_key not in st.session_state:
         st.session_state[ref_key] = new_txn_ref(nid)
     txn_ref = st.session_state[ref_key]
-    upi_uri = build_upi_uri(amount, f"DriveShieldX challan #{nid}", txn_ref)
+    note = f"DriveShieldX challan #{nid}"
+    upi_uri = build_upi_uri(amount, note, txn_ref)
 
-    st.markdown("<div class='panel-card' style='border-color:rgba(242,169,59,.5)'>", unsafe_allow_html=True)
-    st.markdown(f"<div class='section-title'>Secure UPI Checkout · ₹{amount:,.0f}</div>", unsafe_allow_html=True)
     cc1, cc2 = st.columns([1, 1.3])
     with cc1:
         png = qr_png_bytes(upi_uri)
@@ -1549,28 +1606,68 @@ def render_checkout(notice: dict, amount: float) -> None:
             st.code(upi_uri, language="text")
         st.caption(f"Payee: {PAYEE_VPA}")
     with cc2:
-        st.markdown(f"<div class='small-muted'>Order reference</div><div style='font-family:JetBrains Mono;"
-                    f"color:var(--gold-hi);margin-bottom:.4rem'>{txn_ref}</div>", unsafe_allow_html=True)
-        method = st.radio("Pay using", ["Google Pay", "PhonePe", "Paytm", "Other UPI app"],
-                          key=f"method_{nid}", horizontal=False)
-        st.caption("On a phone, the button below would deep-link into the app. Here, scan the QR with your "
-                   "UPI app, then tap ‘I have paid — verify’ to confirm settlement.")
-        vc1, vc2 = st.columns(2)
-        if vc1.button("I have paid — verify", key=f"verify_{nid}", use_container_width=True):
+        st.markdown(
+            f"<div class='small-muted'>Order reference</div><div style='font-family:JetBrains Mono;"
+            f"color:var(--gold-hi);margin-bottom:.6rem'>{txn_ref}</div>",
+            unsafe_allow_html=True,
+        )
+        st.caption("On a phone these open the app directly; on desktop, scan the QR instead.")
+        # per-app deep links — all built from the same standards-compliant UPI URI, just
+        # with the scheme each app's own intent filter listens for.
+        app_schemes = {
+            "Google Pay": upi_uri.replace("upi://", "tez://upi/", 1),
+            "PhonePe": upi_uri.replace("upi://", "phonepe://", 1),
+            "Paytm": upi_uri.replace("upi://", "paytmmp://", 1),
+            "BHIM / other UPI app": upi_uri,
+        }
+        acols = st.columns(2)
+        for i, (app_name, deep_link) in enumerate(app_schemes.items()):
+            with acols[i % 2]:
+                st.link_button(app_name, deep_link, use_container_width=True)
+        st.caption("After paying, tap below to confirm settlement.")
+        if st.button("I have paid — verify", key=f"verify_{nid}", use_container_width=True):
             with st.spinner("Verifying payment with gateway…"):
                 ok, gateway_id = gateway_simulate_verify(txn_ref)
             if ok:
-                pay_notice(nid, method, txn_ref=f"{txn_ref}/{gateway_id}")
-                st.session_state.pop(f"checkout_{nid}", None)
-                st.session_state.pop(ref_key, None)
-                st.success(f"Payment confirmed · {method} · ref {txn_ref}. Challan #{nid} cleared. ✅")
+                _settle_and_notify(nid, "UPI", f"{txn_ref}/{gateway_id}", notice, owner, amount)
                 st.rerun()
             else:
                 st.error("Payment not found yet. Complete the UPI payment, then verify again.")
-        if vc2.button("Cancel", key=f"cancel_{nid}", use_container_width=True):
-            st.session_state.pop(f"checkout_{nid}", None)
+
+
+def _render_card_checkout(notice: dict, amount: float, owner: dict) -> None:
+    from backend.card_payments import validate_card, mask_card, new_txn_ref, gateway_simulate_charge
+    nid = notice["notice_id"]
+    ref_key = f"txnref_{nid}"
+    if ref_key not in st.session_state:
+        st.session_state[ref_key] = new_txn_ref(nid)
+    txn_ref = st.session_state[ref_key]
+
+    st.caption(
+        "Demo checkout — no real card is charged. Any card number that passes a basic "
+        "checksum works (e.g. 4111 1111 1111 1111, any future expiry, any CVV)."
+    )
+    with st.form(key=f"card_form_{nid}", border=False):
+        name_on_card = st.text_input("Name on card", key=f"card_name_{nid}")
+        card_number = st.text_input("Card number", key=f"card_num_{nid}", placeholder="4111 1111 1111 1111")
+        cc1, cc2 = st.columns(2)
+        expiry = cc1.text_input("Expiry (MM/YY)", key=f"card_exp_{nid}", placeholder="12/29")
+        cvv = cc2.text_input("CVV", key=f"card_cvv_{nid}", placeholder="123", type="password")
+        pay_clicked = st.form_submit_button(f"Pay ₹{amount:,.0f}", use_container_width=True)
+
+    if pay_clicked:
+        ok, err = validate_card(card_number, expiry, cvv, name_on_card)
+        if not ok:
+            st.error(err)
+            return
+        masked = mask_card(card_number)
+        with st.spinner(f"Charging {masked}…"):
+            charged, gateway_id = gateway_simulate_charge(amount, masked, txn_ref)
+        if charged:
+            _settle_and_notify(nid, f"Card ({masked})", f"{txn_ref}/{gateway_id}", notice, owner, amount)
             st.rerun()
-    st.markdown("</div>", unsafe_allow_html=True)
+        else:
+            st.error("Card declined. Please try another card.")
 
 
 def page_owner_vehicles() -> None:
