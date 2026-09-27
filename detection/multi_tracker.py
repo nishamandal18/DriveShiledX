@@ -161,7 +161,8 @@ class HybridTracker:
             from detection.vehicle_detector import VehicleDetector
 
             detector = VehicleDetector(
-                model_path="yolov8n.pt",
+
+                yolo_model="yolov8n.pt",
                 confidence=self.conf,
             )
 
